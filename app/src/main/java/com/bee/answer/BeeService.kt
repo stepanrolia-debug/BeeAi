@@ -3,6 +3,7 @@ package com.bee.answer
 import android.accessibilityservice.AccessibilityService
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
@@ -15,6 +16,7 @@ import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.widget.ImageView
+import android.widget.TextView
 import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +30,7 @@ class BeeService : AccessibilityService() {
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var wm: WindowManager
     private var btn: ImageView? = null
+    private var status: TextView? = null
     private val markers = ArrayList<ImageView>()
     private lateinit var frames: List<Bitmap>
     private lateinit var bmpOn: Bitmap
@@ -57,6 +60,27 @@ class BeeService : AccessibilityService() {
         bmpOff = load(R.drawable.bee_unactiv)
         bmpMain = load(R.drawable.bee_main)
         addButton()
+        addStatus()
+    }
+
+    private fun addStatus() {
+        val t = TextView(this)
+        t.setTextColor(Color.WHITE)
+        t.textSize = 14f
+        t.maxWidth = resources.displayMetrics.widthPixels * 9 / 10
+        t.setBackgroundColor(0xCC000000.toInt())
+        t.setPadding(dp(10), dp(6), dp(10), dp(6))
+        t.visibility = View.GONE
+        val lp = params(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, false)
+        lp.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+        lp.y = dp(90)
+        wm.addView(t, lp)
+        status = t
+    }
+
+    private fun setStatus(s: String?) {
+        val t = status ?: return
+        if (s == null) { t.visibility = View.GONE } else { t.text = "[v2] " + s; t.alpha = 1f; t.visibility = View.VISIBLE }
     }
 
     private fun params(w: Int, h: Int, touchable: Boolean): WindowManager.LayoutParams {
@@ -104,6 +128,7 @@ class BeeService : AccessibilityService() {
         busy = false
         lastSig = null
         clearMarkers()
+        setStatus(null)
         if (active) {
             btn?.setImageBitmap(bmpOn)
             toast("Bee увімкнено 🐝")
@@ -119,6 +144,7 @@ class BeeService : AccessibilityService() {
         busy = true
         val g = gen
         markers.forEach { it.visibility = View.INVISIBLE }
+        status?.alpha = 0f
         ui.postDelayed({ if (g == gen) shoot(g) }, 250)
     }
 
@@ -134,11 +160,11 @@ class BeeService : AccessibilityService() {
                 val hw = r.hardwareBuffer
                 val bmp = Bitmap.wrapHardwareBuffer(hw, r.colorSpace)?.copy(Bitmap.Config.ARGB_8888, false)
                 hw.close()
-                if (bmp == null || g != gen) { finish(g, 3000); return }
+                if (bmp == null || g != gen) { setStatus("❌ Знімок екрана порожній"); finish(g, 3000); return }
                 handleShot(bmp, g)
             }
             override fun onFailure(errorCode: Int) {
-                toast("Не вдалося зробити знімок екрана ($errorCode)")
+                setStatus("❌ Знімок екрана не вдався (код $errorCode)")
                 finish(g, 5000)
             }
         })
@@ -166,22 +192,30 @@ class BeeService : AccessibilityService() {
         val prev = lastSig
         if (prev != null && same(prev, sig)) {
             markers.forEach { it.visibility = View.VISIBLE }
+            status?.alpha = 1f
             finish(g, 3000)
             return
         }
         lastSig = sig
+        setStatus("🤔 Gemini думає…")
         startAnim(g)
         Thread {
-            var boxes: List<IntArray>? = null
+            var res: List<Answer>? = null
             var err: String? = null
-            try { boxes = askGemini(bmp) } catch (e: Exception) { err = e.message ?: e.toString() }
+            try { res = askGemini(bmp) } catch (e: Exception) { err = e.message ?: e.toString() }
             ui.post {
                 if (g != gen) return@post
                 animating = false
                 btn?.setImageBitmap(bmpOn)
                 clearMarkers()
-                if (err != null) { toast(err); lastSig = null; finish(g, 6000) }
-                else { showMarkers(boxes ?: emptyList()); finish(g, 3000) }
+                if (err != null) { setStatus("❌ " + err.take(220)); lastSig = null; finish(g, 6000) }
+                else {
+                    val list = res ?: emptyList()
+                    if (list.isEmpty()) setStatus("Gemini не знайшов тест на екрані")
+                    else setStatus("✅ Відповідь: " + list.joinToString(", ") { it.letter })
+                    showMarkers(list)
+                    finish(g, 3000)
+                }
             }
         }.start()
     }
@@ -203,9 +237,12 @@ class BeeService : AccessibilityService() {
         markers.clear()
     }
 
-    private fun showMarkers(boxes: List<IntArray>) {
+    private class Answer(val letter: String, val box: IntArray?)
+
+    private fun showMarkers(answers: List<Answer>) {
         val size = dp(36)
-        for (b in boxes) {
+        for (a in answers) {
+            val b = a.box ?: continue
             val v = ImageView(this)
             v.setImageBitmap(bmpMain)
             val lp = params(size, size, false)
@@ -218,7 +255,7 @@ class BeeService : AccessibilityService() {
 
     private val prompt = """На скріншоті екрана телефона може бути тест з варіантами відповідей (А, Б, В, Г або A, B, C, D або 1, 2, 3...). Для КОЖНОГО повністю видимого питання вибери єдину правильну відповідь. Поверни ТІЛЬКИ JSON без пояснень у форматі: {"answers":[{"letter":"Б","box_2d":[ymin,xmin,ymax,xmax]}]} де box_2d - рамка рядка тексту правильного варіанту відповіді, координати від 0 до 1000. Якщо на екрані немає тесту - поверни {"answers":[]}."""
 
-    private fun askGemini(bmp: Bitmap): List<IntArray> {
+    private fun askGemini(bmp: Bitmap): List<Answer> {
         val prefs = getSharedPreferences("bee", MODE_PRIVATE)
         val key = (prefs.getString("key", "") ?: "").trim()
         if (key.isEmpty()) throw Exception("Немає ключа Gemini. Відкрий додаток Bee і встав ключ.")
@@ -248,11 +285,15 @@ class BeeService : AccessibilityService() {
         val sb = StringBuilder()
         for (i in 0 until parts.length()) sb.append(parts.getJSONObject(i).optString("text"))
         val clean = sb.toString().replace("```json", "").replace("```", "").trim()
-        val arr = JSONObject(clean).optJSONArray("answers") ?: return emptyList()
-        val out = ArrayList<IntArray>()
+        val arr = try { JSONObject(clean).optJSONArray("answers") } catch (e: Exception) {
+            throw Exception("Не розібрав відповідь Gemini: " + clean.take(100))
+        } ?: return emptyList()
+        val out = ArrayList<Answer>()
         for (i in 0 until arr.length()) {
-            val b = arr.getJSONObject(i).optJSONArray("box_2d") ?: continue
-            if (b.length() == 4) out.add(IntArray(4) { b.getInt(it) })
+            val o = arr.getJSONObject(i)
+            val b = o.optJSONArray("box_2d")
+            val box = if (b != null && b.length() == 4) IntArray(4) { b.optInt(it) } else null
+            out.add(Answer(o.optString("letter", "?"), box))
         }
         return out
     }
@@ -263,6 +304,7 @@ class BeeService : AccessibilityService() {
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
         clearMarkers()
+        try { status?.let { wm.removeView(it) } } catch (_: Exception) {}
         try { btn?.let { wm.removeView(it) } } catch (_: Exception) {}
         super.onDestroy()
     }
