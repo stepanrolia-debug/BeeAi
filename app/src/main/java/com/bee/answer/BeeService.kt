@@ -80,7 +80,7 @@ class BeeService : AccessibilityService() {
 
     private fun setStatus(s: String?) {
         val t = status ?: return
-        if (s == null) { t.visibility = View.GONE } else { t.text = "[v2] " + s; t.alpha = 1f; t.visibility = View.VISIBLE }
+        if (s == null) { t.visibility = View.GONE } else { t.text = "[v3] " + s; t.alpha = 1f; t.visibility = View.VISIBLE }
     }
 
     private fun params(w: Int, h: Int, touchable: Boolean): WindowManager.LayoutParams {
@@ -255,19 +255,7 @@ class BeeService : AccessibilityService() {
 
     private val prompt = """На скріншоті екрана телефона може бути тест з варіантами відповідей (А, Б, В, Г або A, B, C, D або 1, 2, 3...). Для КОЖНОГО повністю видимого питання вибери єдину правильну відповідь. Поверни ТІЛЬКИ JSON без пояснень у форматі: {"answers":[{"letter":"Б","box_2d":[ymin,xmin,ymax,xmax]}]} де box_2d - рамка рядка тексту правильного варіанту відповіді, координати від 0 до 1000. Якщо на екрані немає тесту - поверни {"answers":[]}."""
 
-    private fun askGemini(bmp: Bitmap): List<Answer> {
-        val prefs = getSharedPreferences("bee", MODE_PRIVATE)
-        val key = (prefs.getString("key", "") ?: "").trim()
-        if (key.isEmpty()) throw Exception("Немає ключа Gemini. Відкрий додаток Bee і встав ключ.")
-        val model = (prefs.getString("model", "") ?: "").trim().ifEmpty { "gemini-2.5-flash" }
-        val bos = ByteArrayOutputStream()
-        bmp.compress(Bitmap.CompressFormat.JPEG, 85, bos)
-        val b64 = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
-        val body = JSONObject()
-            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
-                .put(JSONObject().put("text", prompt))
-                .put(JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64))))))
-            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0))
+    private fun callGemini(model: String, key: String, body: String): Pair<Int, String> {
         val con = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
             .openConnection() as HttpURLConnection
         con.requestMethod = "POST"
@@ -276,9 +264,57 @@ class BeeService : AccessibilityService() {
         con.readTimeout = 90000
         con.setRequestProperty("Content-Type", "application/json")
         con.setRequestProperty("x-goog-api-key", key)
-        con.outputStream.use { it.write(body.toString().toByteArray()) }
+        con.outputStream.use { it.write(body.toByteArray()) }
         val code = con.responseCode
         val text = (if (code in 200..299) con.inputStream else con.errorStream).bufferedReader().readText()
+        return Pair(code, text)
+    }
+
+    // Шукає у ключа підходящу flash-модель, яка вміє дивитись на картинки
+    private fun findModel(key: String): String? {
+        val con = URL("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200")
+            .openConnection() as HttpURLConnection
+        con.connectTimeout = 20000
+        con.readTimeout = 30000
+        con.setRequestProperty("x-goog-api-key", key)
+        val code = con.responseCode
+        val text = (if (code in 200..299) con.inputStream else con.errorStream).bufferedReader().readText()
+        if (code != 200) throw Exception("Не можу отримати список моделей ($code): " + text.take(120))
+        val arr = JSONObject(text).optJSONArray("models") ?: return null
+        val names = ArrayList<String>()
+        for (i in 0 until arr.length()) {
+            val m = arr.getJSONObject(i)
+            val methods = m.optJSONArray("supportedGenerationMethods")?.toString() ?: ""
+            val n = m.optString("name").removePrefix("models/")
+            val bad = listOf("lite", "image", "tts", "live", "audio", "embedding", "thinking", "exp", "robotics", "computer")
+            if (methods.contains("generateContent") && n.contains("flash") && bad.none { n.contains(it) }) names.add(n)
+        }
+        return names.firstOrNull { it.endsWith("flash-latest") } ?: names.sortedDescending().firstOrNull()
+    }
+
+    private fun askGemini(bmp: Bitmap): List<Answer> {
+        val prefs = getSharedPreferences("bee", MODE_PRIVATE)
+        val key = (prefs.getString("key", "") ?: "").trim()
+        if (key.isEmpty()) throw Exception("Немає ключа Gemini. Відкрий додаток Bee і встав ключ.")
+        var model = (prefs.getString("model", "") ?: "").trim().ifEmpty { "gemini-flash-latest" }
+        val bos = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, bos)
+        val b64 = Base64.encodeToString(bos.toByteArray(), Base64.NO_WRAP)
+        val body = JSONObject()
+            .put("contents", JSONArray().put(JSONObject().put("parts", JSONArray()
+                .put(JSONObject().put("text", prompt))
+                .put(JSONObject().put("inline_data", JSONObject().put("mime_type", "image/jpeg").put("data", b64))))))
+            .put("generationConfig", JSONObject().put("responseMimeType", "application/json").put("temperature", 0))
+        var r = callGemini(model, key, body.toString())
+        if (r.first == 404) {
+            val found = findModel(key)
+            if (found != null && found != model) {
+                r = callGemini(found, key, body.toString())
+                if (r.first == 200) prefs.edit().putString("model", found).apply()
+            }
+        }
+        val code = r.first
+        val text = r.second
         if (code != 200) throw Exception("Gemini помилка $code: " + text.take(150))
         val parts = JSONObject(text).getJSONArray("candidates").getJSONObject(0)
             .getJSONObject("content").getJSONArray("parts")
